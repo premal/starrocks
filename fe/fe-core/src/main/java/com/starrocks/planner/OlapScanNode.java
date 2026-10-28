@@ -1095,7 +1095,10 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
             output.append(prefix).append("Prepared Physical Split Scan: true\n");
         }
 
-        if (rowStoreKeyLiterals.size() != 0 && rowStoreKeyLiterals.get(0).size() != 0) {
+        // secondary-index short circuit scans carry no row-store key literals,
+        // so also honor the fragment flag to keep EXPLAIN truthful for both modes
+        if ((rowStoreKeyLiterals.size() != 0 && rowStoreKeyLiterals.get(0).size() != 0) ||
+                (getFragment() != null && getFragment().isShortCircuit())) {
             output.append(prefix).append("Short Circuit Scan: true\n");
         }
 

@@ -256,7 +256,11 @@ public class ShortCircuitHybridExecutor extends ShortCircuitExecutor {
             if (planFragment.getSink() != null) {
                 commonRequest.setData_sink(planFragment.sinkToThrift());
             }
-            commonRequest.setKey_literal_exprs(keyLiteralExprs);
+            // secondary-index scans carry no pk literals; leaving the optional
+            // field unset puts the backend scan node into index-scan mode
+            if (!keyLiteralExprs.isEmpty()) {
+                commonRequest.setKey_literal_exprs(keyLiteralExprs);
+            }
 
             List<Long> tabletIds = be2Tablets.get(be).stream().map(TabletWithVersion::getTabletId)
                     .collect(Collectors.toList());
