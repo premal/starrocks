@@ -15,8 +15,6 @@
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.catalog.Column;
-import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Pair;
 import com.starrocks.sql.ast.expression.BinaryPredicate;
@@ -28,9 +26,7 @@ import com.starrocks.sql.ast.expression.Parameter;
 import com.starrocks.sql.ast.expression.SlotRef;
 
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public class QueryStatement extends StatementBase {
     private final QueryRelation queryRelation;
@@ -106,20 +102,11 @@ public class QueryStatement extends StatementBase {
             return false;
         }
 
-        OlapTable olapTable = (OlapTable) ((TableRelation) selectRelation.getRelation()).getTable();
-        List<Column> pkColumns = olapTable.getKeyColumns();
-        if (pkColumns.size() != eqPredicates.size()) {
-            return false;
-        }
-
-        for (Column column : pkColumns) {
-            SlotRef slotRef = findSlotRef(eqPredicates.keySet(), column.getName());
-            if (slotRef == null) {
-                return false;
-            }
-        }
-
-        return true;
+        // Every conjunct is a column = parameter(literal) equality. The rebind
+        // machinery in PrepareStmtPlanner is column-agnostic, so any column is
+        // cacheable here, not just key columns; non-equality conjuncts are
+        // rejected by getEQBinaryPredicates above.
+        return !eqPredicates.isEmpty();
     }
 
     private static Map<SlotRef, Expr> getEQBinaryPredicates(Map<SlotRef, Expr> result, Expr expr,
@@ -170,15 +157,6 @@ public class QueryStatement extends StatementBase {
                 (((Parameter) leftExpr).getExpr() instanceof LiteralExpr)) {
             SlotRef slot = (SlotRef) rightExpr;
             return Pair.create(slot, ((Parameter) leftExpr).getExpr());
-        }
-        return null;
-    }
-
-    private SlotRef findSlotRef(Set<SlotRef> slotRefs, String colName) {
-        for (SlotRef slotRef : slotRefs) {
-            if (slotRef.getColumnName().equalsIgnoreCase(colName)) {
-                return slotRef;
-            }
         }
         return null;
     }

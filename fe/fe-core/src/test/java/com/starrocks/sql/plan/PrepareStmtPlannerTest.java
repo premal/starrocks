@@ -712,6 +712,54 @@ public class PrepareStmtPlannerTest extends PlanTestBase {
                 List.of(intLit(1), intLit(2)), List.of(intLit(4), intLit(5)));
     }
 
+    // the cache gate was widened from "all key columns" to "a pure equality conjunction on any columns"
+    @Test
+    public void testNonKeyEqualityUsesThePlanCache() throws Exception {
+        String sql = "select k1 from pq_dup3 where v = ?";
+        PreparedQuery prepared = prepare(sql);
+        ExecPlan first = execute(prepared, new StringLiteral("a"));
+        ExecPlan second = execute(prepared, new StringLiteral("b"));
+        ExecPlan fresh = execute(prepare(sql), List.of(new StringLiteral("b")));
+
+        Assertions.assertAll(
+                () -> Assertions.assertTrue(prepared.context().isCached()),
+                () -> Assertions.assertSame(first.getPhysicalPlan(), second.getPhysicalPlan()),
+                () -> Assertions.assertEquals(scanBindings(fresh), scanBindings(second)),
+                () -> Assertions.assertEquals(scanBindingTypes(fresh), scanBindingTypes(second)));
+    }
+
+    @Test
+    public void testMixedKeyAndNonKeyEqualityUsesThePlanCache() throws Exception {
+        assertStaysCached("select v from pq_dup3 where k1 = ? and v = ?",
+                List.of(intLit(1), new StringLiteral("a")),
+                List.of(intLit(2), new StringLiteral("b")));
+    }
+
+    @Test
+    public void testPartialKeyEqualityUsesThePlanCache() throws Exception {
+        assertStaysCached("select v from pq_dup3 where k1 = ?",
+                List.of(intLit(1)), List.of(intLit(2)));
+    }
+
+    @Test
+    public void testNonPointShapesOnNonKeyColumnsStayUncached() throws Exception {
+        assertNotCached("select k1 from pq_dup3 where v > ?",
+                List.of(new StringLiteral("a")));
+        assertNotCached("select k1 from pq_dup3 where v = ? or k1 = ?",
+                List.of(new StringLiteral("a"), intLit(1)));
+        assertNotCached("select k1 from pq_dup3 where v = ? limit 1",
+                List.of(new StringLiteral("a")));
+        assertNotCached("select k1 from pq_dup3 where v in (?)",
+                List.of(new StringLiteral("a")));
+    }
+
+    private static void assertNotCached(String sql, List<Expr> params) throws Exception {
+        PreparedQuery prepared = prepare(sql);
+        execute(prepared, params);
+        execute(prepared, params);
+        Assertions.assertFalse(prepared.context().isCached(), sql);
+    }
+
     @Test
     public void testWiderIntegerParameterStillRebinds() throws Exception {
         PreparedQuery prepared = prepare("select v1 from tprimary where pk = ?");
