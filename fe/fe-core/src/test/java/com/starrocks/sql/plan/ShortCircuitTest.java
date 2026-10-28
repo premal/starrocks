@@ -253,6 +253,55 @@ public class ShortCircuitTest extends PlanTestBase {
                         "Backend node not found. Check if any backend node is down.backend:");
     }
 
+    @Test
+    public void testSecondaryIndexShortCircuit() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE `tbitmap_sec` (\n" +
+                "  `id` int NOT NULL,\n" +
+                "  `tag` varchar(20) NOT NULL,\n" +
+                "  `region` varchar(20) NOT NULL,\n" +
+                "  `v1` int NOT NULL,\n" +
+                "  INDEX idx_tag (`tag`) USING BITMAP,\n" +
+                "  INDEX idx_region (`region`) USING BITMAP\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(`id`)\n" +
+                "DISTRIBUTED BY HASH(`id`) BUCKETS 1\n" +
+                "PROPERTIES (\"replication_num\" = \"1\");");
+        boolean oldShortCircuit = connectContext.getSessionVariable().isEnableShortCircuit();
+        boolean oldUnitTest = FeConstants.runningUnitTest;
+        connectContext.getSessionVariable().setEnableShortCircuit(true);
+        FeConstants.runningUnitTest = true;
+        try {
+            // equality on a bitmap-indexed column short circuits even without pk coverage
+            String sql = "select * from tbitmap_sec where tag = 'x'";
+            Assertions.assertTrue(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            sql = "select * from tbitmap_sec where tag in ('a', 'b', 'c')";
+            Assertions.assertTrue(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            sql = "select * from tbitmap_sec where tag = 'x' and region = 'y'";
+            Assertions.assertTrue(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            // non-indexed column stays on the normal path
+            sql = "select * from tbitmap_sec where v1 = 1";
+            Assertions.assertFalse(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            // a range predicate cannot resolve through the index lookup
+            sql = "select * from tbitmap_sec where tag > 'x'";
+            Assertions.assertFalse(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            // every conjunct must be indexed; an unindexed conjunct would scan
+            sql = "select * from tbitmap_sec where tag = 'x' and v1 = 1";
+            Assertions.assertFalse(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+
+            sql = "select * from tbitmap_sec where tag = 'x' or region = 'y'";
+            Assertions.assertFalse(getFragmentPlan(sql).contains("Short Circuit Scan: true"));
+        } finally {
+            connectContext.getSessionVariable().setEnableShortCircuit(oldShortCircuit);
+            FeConstants.runningUnitTest = oldUnitTest;
+            starRocksAssert.dropTable("tbitmap_sec");
+        }
+    }
+
     @NotNull
     private static TScanRangeLocations gettScanRangeLocations(long backendId) {
         TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
