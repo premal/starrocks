@@ -214,9 +214,8 @@ static size_t _expr_subtree_size(const std::vector<TExprNode>& nodes, size_t idx
     return size;
 }
 
-Status ShortCircuitHybridScanNode::_literal_to_storage_string(RuntimeState* state,
-                                                              const std::vector<TExprNode>& nodes, size_t idx,
-                                                              size_t size, std::string* out) {
+Status ShortCircuitHybridScanNode::_literal_to_storage_string(RuntimeState* state, const std::vector<TExprNode>& nodes,
+                                                              size_t idx, size_t size, std::string* out) {
     TExpr literal_texpr;
     literal_texpr.nodes.assign(nodes.begin() + idx, nodes.begin() + idx + size);
     std::vector<ExprContext*> expr_ctxs;
@@ -251,11 +250,12 @@ Status ShortCircuitHybridScanNode::_build_secondary_predicates(RuntimeState* sta
             size_t left_size = _expr_subtree_size(nodes, 1);
             if (nodes[1].node_type == TExprNodeType::SLOT_REF) {
                 slot_idx = 1;
-                RETURN_IF_ERROR(_literal_to_storage_string(state, nodes, 1 + left_size,
-                                                         nodes.size() - 1 - left_size, &operand_strings->emplace_back()));
+                RETURN_IF_ERROR(_literal_to_storage_string(state, nodes, 1 + left_size, nodes.size() - 1 - left_size,
+                                                           &operand_strings->emplace_back()));
             } else if (nodes[1 + left_size].node_type == TExprNodeType::SLOT_REF) {
                 slot_idx = 1 + left_size;
-                RETURN_IF_ERROR(_literal_to_storage_string(state, nodes, 1, left_size, &operand_strings->emplace_back()));
+                RETURN_IF_ERROR(
+                        _literal_to_storage_string(state, nodes, 1, left_size, &operand_strings->emplace_back()));
             } else {
                 return Status::NotSupported("secondary short circuit: equality has no column side");
             }
@@ -269,8 +269,7 @@ Status ShortCircuitHybridScanNode::_build_secondary_predicates(RuntimeState* sta
                 size_t child_size = _expr_subtree_size(nodes, idx);
                 // NULL can never satisfy IN(...); skip null elements so e.g.
                 // col IN ('a', NULL) still returns the 'a' matches.
-                Status st =
-                        _literal_to_storage_string(state, nodes, idx, child_size, &operand_strings->emplace_back());
+                Status st = _literal_to_storage_string(state, nodes, idx, child_size, &operand_strings->emplace_back());
                 if (st.is_end_of_file()) {
                     operand_strings->pop_back();
                 } else {
@@ -337,12 +336,11 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
     constexpr size_t MAX_PARALLEL_TABLET_SCANS = 8;
     std::deque<std::pair<size_t, std::future<StatusOr<ChunkPtr>>>> inflight;
     for (size_t i = 0; i < _tablets.size(); ++i) {
-        inflight.emplace_back(i,
-                              std::async(std::launch::async,
-                                         [this, i, &value_field_names, &value_column_ids, &value_schema]() {
-                                             return _scan_one_tablet(_tablets[i], _versions[i], value_field_names,
-                                                                     value_column_ids, *value_schema);
-                                         }));
+        inflight.emplace_back(
+                i, std::async(std::launch::async, [this, i, &value_field_names, &value_column_ids, &value_schema]() {
+                    return _scan_one_tablet(_tablets[i], _versions[i], value_field_names, value_column_ids,
+                                            *value_schema);
+                }));
         if (inflight.size() >= MAX_PARALLEL_TABLET_SCANS) {
             ASSIGN_OR_RETURN(ChunkPtr tablet_chunk, inflight.front().second.get());
             if (_value_chunk->num_rows() + tablet_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
@@ -450,8 +448,7 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
             Roaring row_bitmap = range2roaring(scan_range);
             if (is_primary_keys && read_version > 0) {
                 DelVectorPtr delvec;
-                RETURN_IF_ERROR(delvec_loader.load(TabletSegmentId(tablet->tablet_id(), rssid), read_version,
-                                                   &delvec));
+                RETURN_IF_ERROR(delvec_loader.load(TabletSegmentId(tablet->tablet_id(), rssid), read_version, &delvec));
                 if (delvec != nullptr && !delvec->empty()) {
                     row_bitmap -= *(delvec->roaring());
                 }
@@ -464,9 +461,8 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
             rssid_to_segment[rssid] = segment;
             total_rows += rowids.size();
             if (total_rows > MAX_SECONDARY_SCAN_ROWS) {
-                return Status::InternalError(
-                        fmt::format("secondary short circuit matched more than {} rows, aborting",
-                                    MAX_SECONDARY_SCAN_ROWS));
+                return Status::InternalError(fmt::format("secondary short circuit matched more than {} rows, aborting",
+                                                         MAX_SECONDARY_SCAN_ROWS));
             }
         }
     }
@@ -483,8 +479,7 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
     for (uint32_t i = 0; i < value_column_ids.size(); ++i) {
         value_column_ids_by_order_with_orig_idx.emplace_back(value_column_ids[i], i);
     }
-    std::sort(value_column_ids_by_order_with_orig_idx.begin(),
-              value_column_ids_by_order_with_orig_idx.end());
+    std::sort(value_column_ids_by_order_with_orig_idx.begin(), value_column_ids_by_order_with_orig_idx.end());
     std::vector<uint32_t> sorted_column_ids;
     sorted_column_ids.reserve(value_column_ids_by_order_with_orig_idx.size());
     for (const auto& p : value_column_ids_by_order_with_orig_idx) {
@@ -496,9 +491,8 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
         read_columns[i] = ChunkFactory::column_from_field(*read_column_schema.field(i))->clone_empty();
     }
     if (is_primary_keys) {
-        RETURN_IF_ERROR(tablet->updates()->get_column_values(sorted_column_ids, read_version, false,
-                                                             rowids_by_rssid, &read_columns, nullptr,
-                                                             tablet_schema));
+        RETURN_IF_ERROR(tablet->updates()->get_column_values(sorted_column_ids, read_version, false, rowids_by_rssid,
+                                                             &read_columns, nullptr, tablet_schema));
     } else {
         // Non-PK tablets have no TabletUpdates; fetch each column by rowid
         // directly from the already-open segments (the same primitive
@@ -516,13 +510,10 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
             iter_opts.use_page_cache = true;
             iter_opts.read_file = read_file.get();
             for (uint32_t i = 0; i < sorted_column_ids.size(); ++i) {
-                ASSIGN_OR_RETURN(
-                        auto col_iter,
-                        segment->new_column_iterator_or_default(tablet_schema->column(sorted_column_ids[i]),
-                                                                nullptr));
+                ASSIGN_OR_RETURN(auto col_iter, segment->new_column_iterator_or_default(
+                                                        tablet_schema->column(sorted_column_ids[i]), nullptr));
                 RETURN_IF_ERROR(col_iter->init(iter_opts));
-                RETURN_IF_ERROR(
-                        col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), read_columns[i].get()));
+                RETURN_IF_ERROR(col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), read_columns[i].get()));
                 const auto& field = tablet_schema->schema()->field(sorted_column_ids[i]);
                 if (field->type()->type() == TYPE_CHAR) {
                     ChunkHelper::padding_char_column(tablet_schema, *field, read_columns[i].get());
@@ -537,11 +528,9 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
     return tablet_chunk;
 }
 
-StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletSharedPtr& tablet,
-                                                                const std::string& version,
-                                                                const std::vector<std::string>& value_field_names,
-                                                                const std::vector<starrocks::ColumnId>& value_column_ids,
-                                                                const Schema& value_schema) {
+StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(
+        const TabletSharedPtr& tablet, const std::string& version, const std::vector<std::string>& value_field_names,
+        const std::vector<starrocks::ColumnId>& value_column_ids, const Schema& value_schema) {
     // Rowid fetch needs either TabletUpdates (PK) or raw unmerged rows
     // (DUPLICATE). AGGREGATE/UNIQUE keys require merge-at-read semantics that
     // a raw rowid fetch cannot provide, so they keep the TableReader::scan
@@ -555,8 +544,8 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletShar
         if (!rowid_result.status().is_not_supported()) {
             return rowid_result.status();
         }
-        VLOG_ROW << "secondary short circuit: bitmap rowid path skipped on tablet " << tablet->tablet_id()
-                 << ": " << rowid_result.status();
+        VLOG_ROW << "secondary short circuit: bitmap rowid path skipped on tablet " << tablet->tablet_id() << ": "
+                 << rowid_result.status();
     }
     LocalTableReaderParams params;
     params.version = std::stol(version);
