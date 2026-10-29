@@ -17,8 +17,10 @@
 
 #include "exec/short_circuit_hybrid.h"
 
+#include <deque>
 #include <future>
 
+#include "base/string/slice.h"
 #include "column/chunk_factory.h"
 #include "column/column_helper.h"
 #include "column/datum_convert.h"
@@ -38,6 +40,7 @@
 #include "storage/chunk_helper.h"
 #include "storage/del_vector.h"
 #include "storage/rowset/bitmap_index_evaluator.h"
+#include "storage/rowset/column_iterator.h"
 #include "storage/rowset/options.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/segment.h"
@@ -50,7 +53,6 @@
 #include "storage_primitive/predicate_tree/predicate_tree.h"
 #include "storage_primitive/roaring2range.h"
 #include "types/type_info.h"
-#include "base/string/slice.h"
 
 namespace starrocks {
 
@@ -265,9 +267,19 @@ Status ShortCircuitHybridScanNode::_build_secondary_predicates(RuntimeState* sta
             size_t idx = 2;
             while (idx < nodes.size()) {
                 size_t child_size = _expr_subtree_size(nodes, idx);
-                RETURN_IF_ERROR(
-                        _literal_to_storage_string(state, nodes, idx, child_size, &operand_strings->emplace_back()));
+                // NULL can never satisfy IN(...); skip null elements so e.g.
+                // col IN ('a', NULL) still returns the 'a' matches.
+                Status st =
+                        _literal_to_storage_string(state, nodes, idx, child_size, &operand_strings->emplace_back());
+                if (st.is_end_of_file()) {
+                    operand_strings->pop_back();
+                } else {
+                    RETURN_IF_ERROR(st);
+                }
                 idx += child_size;
+            }
+            if (operand_strings->empty()) {
+                return Status::EndOfFile("secondary short circuit: IN list is all NULL");
             }
         } else {
             return Status::NotSupported("secondary short circuit only supports =/IN literal predicates");
@@ -319,17 +331,29 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
 
     // per-tablet scans are independent; run them in parallel so latency is
     // max-per-tablet rather than the serial sum (the normal pipeline gets this
-    // for free from driver parallelism, the short path has to do it by hand)
-    std::vector<std::future<StatusOr<ChunkPtr>>> tablet_scans;
-    tablet_scans.reserve(_tablets.size());
+    // for free from driver parallelism, the short path has to do it by hand).
+    // std::async threads are uncapped, so bound the in-flight count to keep a
+    // high-bucket table from spawning a thread per tablet under concurrency.
+    constexpr size_t MAX_PARALLEL_TABLET_SCANS = 8;
+    std::deque<std::pair<size_t, std::future<StatusOr<ChunkPtr>>>> inflight;
     for (size_t i = 0; i < _tablets.size(); ++i) {
-        tablet_scans.emplace_back(
-                std::async(std::launch::async, [this, i, &value_field_names, &value_column_ids, &value_schema]() {
-                    return _scan_one_tablet(_tablets[i], _versions[i], value_field_names, value_column_ids,
-                                            *value_schema);
-                }));
+        inflight.emplace_back(i,
+                              std::async(std::launch::async,
+                                         [this, i, &value_field_names, &value_column_ids, &value_schema]() {
+                                             return _scan_one_tablet(_tablets[i], _versions[i], value_field_names,
+                                                                     value_column_ids, *value_schema);
+                                         }));
+        if (inflight.size() >= MAX_PARALLEL_TABLET_SCANS) {
+            ASSIGN_OR_RETURN(ChunkPtr tablet_chunk, inflight.front().second.get());
+            if (_value_chunk->num_rows() + tablet_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
+                return Status::InternalError(fmt::format("secondary short circuit matched more than {} rows, aborting",
+                                                         MAX_SECONDARY_SCAN_ROWS));
+            }
+            _value_chunk->append(*tablet_chunk);
+            inflight.pop_front();
+        }
     }
-    for (auto& scan : tablet_scans) {
+    for (auto& [i, scan] : inflight) {
         ASSIGN_OR_RETURN(ChunkPtr tablet_chunk, scan.get());
         if (_value_chunk->num_rows() + tablet_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
             return Status::InternalError(fmt::format("secondary short circuit matched more than {} rows, aborting",
@@ -342,13 +366,13 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
 }
 
 // Resolve the secondary predicates through each segment's bitmap index into
-// segment-local rowids, then fetch the matching rows via
-// TabletUpdates::get_column_values -- the same row-store/column-fetch tail
-// multi_get uses. This avoids the per-segment iterator setup that
-// TableReader::scan pays and is what makes a ~2ms point read possible.
-// PK tablets only: non-PK tablets have no TabletUpdates and keep the
-// TableReader::scan fallback. Returns NotSupported when any segment cannot
-// serve the predicates from its bitmap index, so the caller falls back.
+// segment-local rowids, then fetch the matching rows by rowid: via
+// TabletUpdates::get_column_values on PK tablets (the multi_get tail, which
+// reads the __row blob on COLUMN_WITH_ROW tablets) or per-segment column
+// iterators on DUPLICATE tablets. This avoids the per-segment iterator setup
+// that TableReader::scan pays and is what makes a ~2ms point read possible.
+// Returns NotSupported when any segment cannot serve the predicates from its
+// bitmap index, so the caller falls back.
 StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids(
         const TabletSharedPtr& tablet, const std::string& version,
         const std::vector<starrocks::ColumnId>& value_column_ids, const Schema& value_schema) {
@@ -369,12 +393,20 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
         cid_2_ucid[field->id()] = field->uid();
     }
 
+    const bool is_primary_keys = tablet->updates() != nullptr;
     std::shared_ptr<FileSystem> fs;
     LocalDelvecLoader delvec_loader(tablet->data_dir()->get_meta());
     OlapReaderStatistics stats;
     std::map<uint32_t, std::vector<uint32_t>> rowids_by_rssid;
+    std::unordered_map<uint32_t, SegmentSharedPtr> rssid_to_segment;
     size_t total_rows = 0;
     for (const auto& rowset : rowsets) {
+        // Rowset-level delete predicates are applied at scan time and the
+        // bitmap index is not aware of them; rows deleted this way would leak
+        // through the rowid fetch, so take the full scan path instead.
+        if (rowset->rowset_meta()->has_delete_predicate()) {
+            return Status::NotSupported("secondary short circuit: rowset has delete predicates");
+        }
         RETURN_IF_ERROR(rowset->load());
         for (size_t seg_id = 0; seg_id < rowset->num_segments(); ++seg_id) {
             const auto& segment = rowset->segments()[seg_id];
@@ -416,7 +448,7 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
                 continue;
             }
             Roaring row_bitmap = range2roaring(scan_range);
-            if (read_version > 0) {
+            if (is_primary_keys && read_version > 0) {
                 DelVectorPtr delvec;
                 RETURN_IF_ERROR(delvec_loader.load(TabletSegmentId(tablet->tablet_id(), rssid), read_version,
                                                    &delvec));
@@ -429,6 +461,7 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
             for (uint32_t rowid : row_bitmap) {
                 rowids.push_back(rowid);
             }
+            rssid_to_segment[rssid] = segment;
             total_rows += rowids.size();
             if (total_rows > MAX_SECONDARY_SCAN_ROWS) {
                 return Status::InternalError(
@@ -462,8 +495,41 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids
     for (uint32_t i = 0; i < read_columns.size(); ++i) {
         read_columns[i] = ChunkFactory::column_from_field(*read_column_schema.field(i))->clone_empty();
     }
-    RETURN_IF_ERROR(tablet->updates()->get_column_values(sorted_column_ids, read_version, false, rowids_by_rssid,
-                                                         &read_columns, nullptr, tablet_schema));
+    if (is_primary_keys) {
+        RETURN_IF_ERROR(tablet->updates()->get_column_values(sorted_column_ids, read_version, false,
+                                                             rowids_by_rssid, &read_columns, nullptr,
+                                                             tablet_schema));
+    } else {
+        // Non-PK tablets have no TabletUpdates; fetch each column by rowid
+        // directly from the already-open segments (the same primitive
+        // get_column_values uses internally). Rows come back in
+        // rssid-sorted order, identical across columns.
+        for (const auto& [rssid, rowids] : rowids_by_rssid) {
+            const auto& segment = rssid_to_segment[rssid];
+            RandomAccessFileOptions ropts;
+            if (segment->encryption_info()) {
+                ropts.encryption_info = *segment->encryption_info();
+            }
+            ASSIGN_OR_RETURN(auto read_file, fs->new_random_access_file(ropts, segment->file_info()));
+            ColumnIteratorOptions iter_opts;
+            iter_opts.stats = &stats;
+            iter_opts.use_page_cache = true;
+            iter_opts.read_file = read_file.get();
+            for (uint32_t i = 0; i < sorted_column_ids.size(); ++i) {
+                ASSIGN_OR_RETURN(
+                        auto col_iter,
+                        segment->new_column_iterator_or_default(tablet_schema->column(sorted_column_ids[i]),
+                                                                nullptr));
+                RETURN_IF_ERROR(col_iter->init(iter_opts));
+                RETURN_IF_ERROR(
+                        col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), read_columns[i].get()));
+                const auto& field = tablet_schema->schema()->field(sorted_column_ids[i]);
+                if (field->type()->type() == TYPE_CHAR) {
+                    ChunkHelper::padding_char_column(tablet_schema, *field, read_columns[i].get());
+                }
+            }
+        }
+    }
     for (size_t j = 0; j < sorted_column_ids.size(); ++j) {
         tablet_chunk->get_column_raw_ptr_by_index(value_column_ids_by_order_with_orig_idx[j].second)
                 ->append(*read_columns[j]);
@@ -476,7 +542,12 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletShar
                                                                 const std::vector<std::string>& value_field_names,
                                                                 const std::vector<starrocks::ColumnId>& value_column_ids,
                                                                 const Schema& value_schema) {
-    if (tablet->updates() != nullptr) {
+    // Rowid fetch needs either TabletUpdates (PK) or raw unmerged rows
+    // (DUPLICATE). AGGREGATE/UNIQUE keys require merge-at-read semantics that
+    // a raw rowid fetch cannot provide, so they keep the TableReader::scan
+    // fallback.
+    const KeysType keys_type = tablet->tablet_schema()->keys_type();
+    if (tablet->updates() != nullptr || keys_type == KeysType::DUP_KEYS) {
         auto rowid_result = _scan_one_tablet_by_bitmap_rowids(tablet, version, value_column_ids, value_schema);
         if (rowid_result.ok()) {
             return std::move(rowid_result.value());
@@ -488,7 +559,7 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletShar
                  << ": " << rowid_result.status();
     }
     LocalTableReaderParams params;
-    params.version = std::stoi(version);
+    params.version = std::stol(version);
     params.tablet_id = tablet->get_tablet_info().tablet_id;
     auto table_reader = std::make_shared<TableReader>();
     RETURN_IF_ERROR(table_reader->init(params));

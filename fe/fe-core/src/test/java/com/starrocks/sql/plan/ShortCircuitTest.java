@@ -92,6 +92,17 @@ public class ShortCircuitTest extends PlanTestBase {
         planFragment = getFragmentPlan(sql);
         Assertions.assertTrue(planFragment.contains("Short Circuit Scan: true"));
 
+        // key count exactly at the limit still cannot over-return
+        sql = "select * from tprimary1 where pk1 in (20, 30) limit 2";
+        planFragment = getFragmentPlan(sql);
+        Assertions.assertTrue(planFragment.contains("Short Circuit Scan: true"));
+
+        // more key tuples than the limit: the point scan does not apply LIMIT,
+        // so it would return more rows than the query allows
+        sql = "select * from tprimary1 where pk1 in (20, 30) limit 1";
+        planFragment = getFragmentPlan(sql);
+        Assertions.assertFalse(planFragment.contains("Short Circuit Scan: true"));
+
         // complex convert for short circuit
         sql = "select * from tprimary_bool where pk1 = 1 and pk2 = true " +
                 "and pk1 =(select pk1 from tprimary_bool where pk1 = 2 and pk2 = true) ";

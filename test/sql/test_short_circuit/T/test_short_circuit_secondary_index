@@ -1,0 +1,86 @@
+-- name: testShortCircuitSecondaryIndex @no_arrow_flight_sql
+set enable_short_circuit=true;
+
+CREATE TABLE sc_sec_idx
+    (id int,
+     tag varchar(20),
+     val int)
+    PRIMARY KEY(id)
+    DISTRIBUTED BY HASH(id)
+    BUCKETS 4
+    PROPERTIES ("replication_num" = "1",
+                "enable_persistent_index" = "true",
+                "storage_type" = "COLUMN_WITH_ROW");
+
+insert into sc_sec_idx values
+(1, 'alpha', 10), (2, 'alpha', 20), (3, 'beta', 30), (4, 'beta', 40),
+(5, 'gamma', 50), (6, 'gamma', 60), (7, 'delta', 70), (8, 'delta', 80);
+
+CREATE INDEX idx_tag ON sc_sec_idx(tag) USING BITMAP;
+
+-- equality on a bitmap-indexed secondary column
+select * from sc_sec_idx where tag = 'alpha' order by id;
+
+-- IN list on the indexed column
+select * from sc_sec_idx where tag in ('alpha', 'gamma') order by id;
+
+-- NULL element in an IN list must not drop the matching rows
+select * from sc_sec_idx where tag in ('alpha', null) order by id;
+
+-- IN list that is all NULL matches nothing
+select * from sc_sec_idx where tag in (null) order by id;
+
+-- no match
+select * from sc_sec_idx where tag = 'omega' order by id;
+
+-- LIMIT on a secondary predicate is not short-circuit-able but must still
+-- produce correct results through the normal path
+select * from sc_sec_idx where tag = 'alpha' order by id limit 1;
+select * from sc_sec_idx where tag in ('alpha', 'beta', 'gamma', 'delta') order by id limit 3;
+
+-- non-indexed secondary column stays on the normal path
+select * from sc_sec_idx where val = 30 order by id;
+
+-- range predicate is not short-circuit eligible
+select * from sc_sec_idx where tag > 'beta' order by id;
+
+-- deleted rows must not leak through the stale bitmap entry
+delete from sc_sec_idx where id = 1;
+select * from sc_sec_idx where tag = 'alpha' order by id;
+
+-- a non-selective bitmap predicate (more matches than the 2048-row cap) must
+-- fall back to the normal pipeline rather than error
+CREATE TABLE sc_sec_wide
+    (id int,
+     grp int,
+     pad varchar(10))
+    PRIMARY KEY(id)
+    DISTRIBUTED BY HASH(id)
+    BUCKETS 1
+    PROPERTIES ("replication_num" = "1",
+                "enable_persistent_index" = "true",
+                "storage_type" = "COLUMN_WITH_ROW");
+
+insert into sc_sec_wide values (1, 7, 'x');
+insert into sc_sec_wide select id + 1, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 2, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 4, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 8, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 16, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 32, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 64, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 128, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 256, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 512, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide select id + 1024, 7, 'x' from sc_sec_wide;
+insert into sc_sec_wide values (3000, 7, 'x');
+
+CREATE INDEX idx_grp ON sc_sec_wide(grp) USING BITMAP;
+
+-- 2049 rows sharing one bitmap value exceeds the 2048-row cap: the short
+-- circuit must fall back to the normal pipeline, not error the query
+select count(*) from sc_sec_wide where grp = 7;
+select id from sc_sec_wide where grp = 7 order by id;
+
+drop table sc_sec_idx;
+drop table sc_sec_wide;
