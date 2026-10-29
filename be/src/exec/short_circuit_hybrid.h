@@ -38,7 +38,10 @@ class ShortCircuitHybridScanNode : public ScanNode {
 public:
     ShortCircuitHybridScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs,
                                const TScanRange& scan_range, TExecShortCircuitParams& common_request)
-            : ScanNode(pool, tnode, descs), _common_request(common_request), _tuple_id(tnode.olap_scan_node.tuple_id) {}
+            : ScanNode(pool, tnode, descs),
+              _common_request(common_request),
+              _t_node(tnode),
+              _tuple_id(tnode.olap_scan_node.tuple_id) {}
 
     Status set_scan_ranges(const std::vector<TScanRangeParams>& scan_ranges) override;
     // do not call ScanNode::prepare which will register some useless profile counters
@@ -48,10 +51,18 @@ public:
 
     Status _process_key_chunk();
     Status _process_value_chunk(std::vector<bool>& found);
+    // secondary-index mode: conjuncts (col =/IN literal on indexed columns) are
+    // resolved through TableReader::scan instead of pk multi_get
+    Status _get_next_secondary(RuntimeState* state, ChunkPtr* chunk, bool* eos);
+    Status _build_secondary_predicates(RuntimeState* state);
+    Status _literal_to_storage_string(RuntimeState* state, const std::vector<TExprNode>& nodes, size_t idx, size_t size,
+                                    std::string* out);
+    Status _process_scan_chunk();
 
 private:
     TableReaderPtr _table_reader;
     TExecShortCircuitParams& _common_request;
+    const TPlanNode& _t_node;
     TDescriptorTable* _t_desc_tbl;
     ChunkPtr _key_chunk;
     ChunkPtr _value_chunk;
@@ -62,5 +73,8 @@ private:
     TupleId _tuple_id;
     std::vector<string> _versions;
     int64_t _num_rows;
+    bool _secondary_mode = false;
+    ObjectPool _secondary_pred_pool;
+    std::vector<const ColumnPredicate*> _secondary_predicates;
 };
 } // namespace starrocks
