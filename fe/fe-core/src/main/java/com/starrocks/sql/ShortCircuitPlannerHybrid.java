@@ -94,7 +94,12 @@ public class ShortCircuitPlannerHybrid {
                 return false;
             }
             Map<String, PartitionColumnFilter> filters = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-            filters.putAll(ColumnFilterConverter.convertColumnFilter(conjuncts, table));
+            try {
+                filters.putAll(ColumnFilterConverter.convertColumnFilter(conjuncts, table));
+            } catch (UnsupportedOperationException e) {
+                // e.g. large-IN conjuncts the converter refuses to map
+                return false;
+            }
             // a conjunct that maps to no column filter (function, OR, non-column ref)
             // would silently run unindexed here, so require full coverage
             if (filters.size() != conjuncts.size()) {
