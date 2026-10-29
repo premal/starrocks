@@ -17,6 +17,8 @@
 
 #include "exec/short_circuit_hybrid.h"
 
+#include <future>
+
 #include "column/chunk_factory.h"
 #include "column/column_helper.h"
 #include "column/datum_convert.h"
@@ -305,34 +307,63 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
     auto value_schema = std::make_unique<Schema>(_tablet_schema->schema(), value_column_ids);
     _value_chunk = ChunkFactory::new_chunk(*value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
 
+    // per-tablet scans are independent; run them in parallel so latency is
+    // max-per-tablet rather than the serial sum (the normal pipeline gets this
+    // for free from driver parallelism, the short path has to do it by hand)
+    std::vector<std::future<StatusOr<ChunkPtr>>> tablet_scans;
+    tablet_scans.reserve(_tablets.size());
     for (size_t i = 0; i < _tablets.size(); ++i) {
-        LocalTableReaderParams params;
-        params.version = std::stoi(_versions[i]);
-        params.tablet_id = _tablets[i]->get_tablet_info().tablet_id;
-        _table_reader = std::make_shared<TableReader>();
-        RETURN_IF_ERROR(_table_reader->init(params));
-        ASSIGN_OR_RETURN(ChunkIteratorPtr iterator,
-                         _table_reader->scan(value_field_names, _secondary_predicates));
-        auto scan_chunk = ChunkFactory::new_chunk(*value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
-        while (true) {
-            scan_chunk->reset();
-            Status status = iterator->get_next(scan_chunk.get());
-            if (status.is_end_of_file()) {
-                break;
-            }
-            RETURN_IF_ERROR(status);
-            if (scan_chunk->num_rows() == 0) {
-                break;
-            }
-            if (_value_chunk->num_rows() + scan_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
-                return Status::InternalError(fmt::format(
-                        "secondary short circuit matched more than {} rows, aborting", MAX_SECONDARY_SCAN_ROWS));
-            }
-            _value_chunk->append(*scan_chunk);
+        tablet_scans.emplace_back(std::async(std::launch::async, [this, i, &value_field_names, &value_schema]() {
+            return _scan_one_tablet(_tablets[i], _versions[i], value_field_names, *value_schema);
+        }));
+    }
+    for (auto& scan : tablet_scans) {
+        ASSIGN_OR_RETURN(ChunkPtr tablet_chunk, scan.get());
+        if (_value_chunk->num_rows() + tablet_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
+            return Status::InternalError(fmt::format("secondary short circuit matched more than {} rows, aborting",
+                                                     MAX_SECONDARY_SCAN_ROWS));
         }
+        _value_chunk->append(*tablet_chunk);
     }
     _num_rows = _value_chunk->num_rows();
     return Status::OK();
+}
+
+StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletSharedPtr& tablet,
+                                                                const std::string& version,
+                                                                const std::vector<std::string>& value_field_names,
+                                                                const Schema& value_schema) {
+    int64_t t0 = MonotonicMillis();
+    LocalTableReaderParams params;
+    params.version = std::stoi(version);
+    params.tablet_id = tablet->get_tablet_info().tablet_id;
+    auto table_reader = std::make_shared<TableReader>();
+    RETURN_IF_ERROR(table_reader->init(params));
+    int64_t t1 = MonotonicMillis();
+    ASSIGN_OR_RETURN(ChunkIteratorPtr iterator, table_reader->scan(value_field_names, _secondary_predicates));
+    int64_t t2 = MonotonicMillis();
+    ChunkPtr tablet_chunk = ChunkFactory::new_chunk(value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
+    auto scan_chunk = ChunkFactory::new_chunk(value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
+    while (true) {
+        scan_chunk->reset();
+        Status status = iterator->get_next(scan_chunk.get());
+        if (status.is_end_of_file()) {
+            break;
+        }
+        RETURN_IF_ERROR(status);
+        if (scan_chunk->num_rows() == 0) {
+            break;
+        }
+        if (tablet_chunk->num_rows() + scan_chunk->num_rows() > MAX_SECONDARY_SCAN_ROWS) {
+            return Status::InternalError(fmt::format("secondary short circuit matched more than {} rows, aborting",
+                                                     MAX_SECONDARY_SCAN_ROWS));
+        }
+        tablet_chunk->append(*scan_chunk);
+    }
+    int64_t t3 = MonotonicMillis();
+    LOG(INFO) << "sec-scan tablet:" << params.tablet_id << " init:" << (t1 - t0) << "ms open:" << (t2 - t1)
+              << "ms read:" << (t3 - t2) << "ms rows:" << tablet_chunk->num_rows();
+    return tablet_chunk;
 }
 
 Status ShortCircuitHybridScanNode::_get_next_secondary(RuntimeState* state, ChunkPtr* chunk, bool* eos) {

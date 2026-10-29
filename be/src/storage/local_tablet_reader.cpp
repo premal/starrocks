@@ -32,9 +32,6 @@ namespace starrocks {
 LocalTabletReader::LocalTabletReader() = default;
 
 Status LocalTabletReader::init(TabletSharedPtr& tablet, int64_t version) {
-    if (tablet->updates() == nullptr) {
-        return Status::NotSupported("LocalTabletReader only support PK tablet");
-    }
     _tablet = tablet;
     _version = version;
     return Status::OK();
@@ -103,6 +100,9 @@ Status LocalTabletReader::multi_get(const Chunk& keys, const std::vector<std::st
 
 Status LocalTabletReader::multi_get(const Chunk& keys, const std::vector<uint32_t>& value_column_ids,
                                     std::vector<bool>& found, Chunk& values) {
+    if (_tablet->updates() == nullptr) {
+        return Status::NotSupported("LocalTabletReader only support PK tablet");
+    }
     int64_t t_start = MonotonicMillis();
     size_t n = keys.num_rows();
     if (n > UINT32_MAX) {

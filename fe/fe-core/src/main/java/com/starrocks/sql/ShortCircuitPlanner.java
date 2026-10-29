@@ -66,10 +66,16 @@ public class ShortCircuitPlanner {
     public static BaseLogicalPlanChecker createLogicalPlanChecker(OptExpression root, boolean allowFilter,
                                                                   boolean allowLimit, boolean allowProject,
                                                                   boolean allowSort, ScalarOperator predicate,
-                                                                  List<String> orderByColumns, long limit) {
+                                                                  List<String> orderByColumns, long limit,
+                                                                  ShortCircuitContext shortCircuitContext) {
         if (root.getOp() instanceof LogicalOlapScanOperator) {
-            return new ShortCircuitPlannerHybrid.LogicalPlanChecker(allowFilter, allowLimit, allowProject,
-                    allowSort, predicate, orderByColumns, limit);
+            ShortCircuitPlannerHybrid.LogicalPlanChecker checker =
+                    new ShortCircuitPlannerHybrid.LogicalPlanChecker(allowFilter, allowLimit, allowProject,
+                            allowSort, predicate, orderByColumns, limit);
+            // share the accumulated context so facts collected above the scan
+            // (e.g. maxReturnRows from a LIMIT node) reach the scan check
+            checker.shortCircuitContext = shortCircuitContext;
+            return checker;
         } else {
             return new BaseLogicalPlanChecker();
         }
@@ -216,7 +222,8 @@ public class ShortCircuitPlanner {
         @Override
         public Boolean visitLogicalTableScan(OptExpression optExpression, Void context) {
             return createLogicalPlanChecker(optExpression, allowFilter, allowLimit, allowProject,
-                    allowSort, predicate, orderByColumns, limit).visitLogicalTableScan(optExpression, context);
+                    allowSort, predicate, orderByColumns, limit,
+                    shortCircuitContext).visitLogicalTableScan(optExpression, context);
         }
 
         protected static boolean isPointScan(Table table,
