@@ -55,6 +55,9 @@ public:
     // resolved through TableReader::scan instead of pk multi_get
     Status _get_next_secondary(RuntimeState* state, ChunkPtr* chunk, bool* eos);
     Status _build_secondary_predicates(RuntimeState* state);
+    StatusOr<ChunkPtr> _scan_one_tablet(const TabletSharedPtr& tablet, const std::string& version,
+                                        const std::vector<std::string>& value_field_names,
+                                        const Schema& value_schema);
     Status _literal_to_storage_string(RuntimeState* state, const std::vector<TExprNode>& nodes, size_t idx, size_t size,
                                     std::string* out);
     Status _process_scan_chunk();

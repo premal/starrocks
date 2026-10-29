@@ -63,6 +63,12 @@ public class ShortCircuitPlannerHybrid {
                 }
             }
 
+            // the short circuit sink never applies LIMIT; a pk point read is
+            // bounded by key count anyway, but a secondary =/IN match is not,
+            // so any LIMIT must run through the normal path
+            if (shortCircuitContext.getMaxReturnRows() != 0 || scanOp.hasLimit()) {
+                return false;
+            }
             return isSecondaryIndexScan(olapTable, conjuncts, shortCircuitContext);
         }
 
