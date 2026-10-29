@@ -70,7 +70,16 @@ public class ExecuteExceptionHandler {
 
     private static final Set<String> SCHEMA_NOT_MATCH_ERROR = ImmutableSet.of("invalid field name");
 
+    // Backend errors raised by the secondary-index short-circuit path all carry this
+    // prefix. A short-circuit failure means no result bytes were sent yet, so the
+    // statement can safely replan on the normal pipeline instead of failing the query.
+    private static final String SECONDARY_SHORT_CIRCUIT_ERR = "secondary short circuit";
+
     public static void handle(Exception e, RetryContext context) throws Exception {
+        if (isSecondaryShortCircuitError(e)) {
+            handleSecondaryShortCircuit(e, context);
+            return;
+        }
         if (e instanceof RemoteFileNotFoundException) {
             handleRemoteFileNotFound((RemoteFileNotFoundException) e, context);
         } else if (e instanceof RpcException) {
@@ -406,6 +415,31 @@ public class ExecuteExceptionHandler {
                         e1);
             }
             throw e;
+        }
+    }
+
+    private static boolean isSecondaryShortCircuitError(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().contains(SECONDARY_SHORT_CIRCUIT_ERR)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The secondary short-circuit gate is permissive by design (no statistics): a
+    // predicate can pass the gate yet exceed the row cap or hit an unsupported form
+    // on the backend. Replacing the exec plan with a normally-planned one reruns the
+    // same statement through the pipeline path, which is strictly a superset.
+    private static void handleSecondaryShortCircuit(Exception e, RetryContext context) throws Exception {
+        SessionVariable sessionVariable = context.connectContext.getSessionVariable();
+        boolean enableShortCircuit = sessionVariable.isEnableShortCircuit();
+        LOG.warn("secondary short circuit execution failed, replanning on normal path: {}", e.getMessage());
+        try {
+            sessionVariable.setEnableShortCircuit(false);
+            rebuildExecPlan(e, context);
+        } finally {
+            sessionVariable.setEnableShortCircuit(enableShortCircuit);
         }
     }
 

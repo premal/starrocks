@@ -8,11 +8,12 @@
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 package com.starrocks.sql;
 
@@ -55,18 +56,25 @@ public class ShortCircuitPlannerHybrid {
 
             OlapTable olapTable = (OlapTable) table;
             List<ScalarOperator> conjuncts = Utils.extractConjuncts(predicate);
+            // LIMIT reaches the scan check either via the context (a LIMIT
+            // node) or folded into the scan operator; -1 means no LIMIT seen
+            long maxReturnRows = -1;
+            if (shortCircuitContext.getMaxReturnRows() != 0) {
+                maxReturnRows = shortCircuitContext.getMaxReturnRows();
+            } else if (scanOp.hasLimit()) {
+                maxReturnRows = scanOp.getLimit();
+            }
             if (KeysType.PRIMARY_KEYS.equals(olapTable.getKeysType())) {
                 List<String> keyColumns = olapTable.getKeyColumns().stream().map(Column::getName).collect(
                         Collectors.toList());
-                if (isPointScan(table, keyColumns, conjuncts, shortCircuitContext)) {
+                if (isPointScan(table, keyColumns, conjuncts, maxReturnRows)) {
                     return true;
                 }
             }
 
-            // the short circuit sink never applies LIMIT; a pk point read is
-            // bounded by key count anyway, but a secondary =/IN match is not,
-            // so any LIMIT must run through the normal path
-            if (shortCircuitContext.getMaxReturnRows() != 0 || scanOp.hasLimit()) {
+            // a pk point read is bounded by key count anyway, but a secondary
+            // =/IN match is not, so any LIMIT must run through the normal path
+            if (maxReturnRows >= 0) {
                 return false;
             }
             return isSecondaryIndexScan(olapTable, conjuncts, shortCircuitContext);
@@ -80,7 +88,9 @@ public class ShortCircuitPlannerHybrid {
         protected static boolean isSecondaryIndexScan(OlapTable table,
                                                       List<ScalarOperator> conjuncts,
                                                       ShortCircuitPlanner.ShortCircuitContext shortCircuitContext) {
-            if (conjuncts.isEmpty()) {
+            // shared-data tablets are not in the local tablet manager, so the
+            // short-circuit executor could not resolve them even if the gate passed
+            if (table.isCloudNativeTable() || conjuncts.isEmpty()) {
                 return false;
             }
             Map<String, PartitionColumnFilter> filters = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
@@ -110,7 +120,8 @@ public class ShortCircuitPlannerHybrid {
                 if (filter.getInPredicateLiterals() != null) {
                     cardinality *= filter.getInPredicateLiterals().size();
                     if (cardinality > ShortCircuitPlanner.MAX_RETURN_ROWS ||
-                            (shortCircuitContext.getMaxReturnRows() != 0 && cardinality != 1)) {
+                            (shortCircuitContext.getMaxReturnRows() != 0 &&
+                                    cardinality > shortCircuitContext.getMaxReturnRows())) {
                         return false;
                     }
                 } else if (!filter.isPoint()) {

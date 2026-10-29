@@ -229,7 +229,7 @@ public class ShortCircuitPlanner {
         protected static boolean isPointScan(Table table,
                                              List<String> keyColumns,
                                              List<ScalarOperator> conjuncts,
-                                             ShortCircuitContext shortCircuitContext) {
+                                             long maxReturnRows) {
             Map<String, PartitionColumnFilter> filters = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
             filters.putAll(ColumnFilterConverter.convertColumnFilter(conjuncts, table));
             if (keyColumns == null || keyColumns.isEmpty()) {
@@ -241,9 +241,11 @@ public class ShortCircuitPlanner {
                     PartitionColumnFilter filter = filters.get(keyColumn);
                     if (filter.getInPredicateLiterals() != null) {
                         cardinality *= filter.getInPredicateLiterals().size();
-                        // TODO(limit operator place fe)
+                        // the short circuit sink never applies LIMIT; a pk key
+                        // tuple yields at most one row, so it is safe iff the
+                        // LIMIT (maxReturnRows >= 0) cannot truncate the tuple set
                         if (cardinality > MAX_RETURN_ROWS ||
-                                (shortCircuitContext.getMaxReturnRows() != 0 && cardinality != 1)) {
+                                (maxReturnRows >= 0 && cardinality > maxReturnRows)) {
                             return false;
                         }
                     } else if (!filter.isPoint()) {
