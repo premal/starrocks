@@ -32,13 +32,23 @@
 #include "exprs/expr.h"
 #include "exprs/expr_executor.h"
 #include "exprs/expr_factory.h"
+#include "fs/fs_factory.h"
 #include "runtime/chunk_helper.h"
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
+#include "storage/del_vector.h"
+#include "storage/rowset/bitmap_index_evaluator.h"
+#include "storage/rowset/options.h"
+#include "storage/rowset/rowset.h"
+#include "storage/rowset/segment.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
+#include "storage/tablet_updates.h"
+#include "storage/update_manager.h"
 #include "storage_primitive/chunk_iterator.h"
 #include "storage_primitive/column_predicate_factory.h"
+#include "storage_primitive/predicate_tree/predicate_tree.h"
+#include "storage_primitive/roaring2range.h"
 #include "types/type_info.h"
 #include "base/string/slice.h"
 
@@ -313,9 +323,11 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
     std::vector<std::future<StatusOr<ChunkPtr>>> tablet_scans;
     tablet_scans.reserve(_tablets.size());
     for (size_t i = 0; i < _tablets.size(); ++i) {
-        tablet_scans.emplace_back(std::async(std::launch::async, [this, i, &value_field_names, &value_schema]() {
-            return _scan_one_tablet(_tablets[i], _versions[i], value_field_names, *value_schema);
-        }));
+        tablet_scans.emplace_back(
+                std::async(std::launch::async, [this, i, &value_field_names, &value_column_ids, &value_schema]() {
+                    return _scan_one_tablet(_tablets[i], _versions[i], value_field_names, value_column_ids,
+                                            *value_schema);
+                }));
     }
     for (auto& scan : tablet_scans) {
         ASSIGN_OR_RETURN(ChunkPtr tablet_chunk, scan.get());
@@ -329,19 +341,158 @@ Status ShortCircuitHybridScanNode::_process_scan_chunk() {
     return Status::OK();
 }
 
+// Resolve the secondary predicates through each segment's bitmap index into
+// segment-local rowids, then fetch the matching rows via
+// TabletUpdates::get_column_values -- the same row-store/column-fetch tail
+// multi_get uses. This avoids the per-segment iterator setup that
+// TableReader::scan pays and is what makes a ~2ms point read possible.
+// PK tablets only: non-PK tablets have no TabletUpdates and keep the
+// TableReader::scan fallback. Returns NotSupported when any segment cannot
+// serve the predicates from its bitmap index, so the caller falls back.
+StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet_by_bitmap_rowids(
+        const TabletSharedPtr& tablet, const std::string& version,
+        const std::vector<starrocks::ColumnId>& value_column_ids, const Schema& value_schema) {
+    int64_t read_version = std::stol(version);
+    const auto& tablet_schema = tablet->tablet_schema();
+
+    PredicateAndNode and_node;
+    for (const auto* pred : _secondary_predicates) {
+        and_node.add_child(PredicateColumnNode{pred});
+    }
+    PredicateTree pred_tree = PredicateTree::create(std::move(and_node));
+
+    std::vector<RowsetSharedPtr> rowsets;
+    RETURN_IF_ERROR(tablet->capture_consistent_rowsets(Version(0, read_version), &rowsets));
+
+    std::unordered_map<ColumnId, ColumnUID> cid_2_ucid;
+    for (const auto& field : tablet_schema->schema()->fields()) {
+        cid_2_ucid[field->id()] = field->uid();
+    }
+
+    std::shared_ptr<FileSystem> fs;
+    LocalDelvecLoader delvec_loader(tablet->data_dir()->get_meta());
+    OlapReaderStatistics stats;
+    std::map<uint32_t, std::vector<uint32_t>> rowids_by_rssid;
+    size_t total_rows = 0;
+    for (const auto& rowset : rowsets) {
+        RETURN_IF_ERROR(rowset->load());
+        for (size_t seg_id = 0; seg_id < rowset->num_segments(); ++seg_id) {
+            const auto& segment = rowset->segments()[seg_id];
+            const uint32_t rssid = rowset->rowset_meta()->get_rowset_seg_id() + seg_id;
+            if (fs == nullptr) {
+                ASSIGN_OR_RETURN(fs, FileSystemFactory::CreateSharedFromString(rowset->rowset_path()));
+            }
+            RandomAccessFileOptions ropts;
+            if (segment->encryption_info()) {
+                ropts.encryption_info = *segment->encryption_info();
+            }
+            ASSIGN_OR_RETURN(auto read_file, fs->new_random_access_file(ropts, segment->file_info()));
+
+            BitmapIndexEvaluator evaluator(*tablet_schema->schema(), pred_tree);
+            RETURN_IF_ERROR(evaluator.init([&](ColumnId cid) -> StatusOr<BitmapIndexIterator*> {
+                IndexReadOptions opts;
+                opts.use_page_cache = true;
+                opts.read_file = read_file.get();
+                opts.stats = &stats;
+                opts.tablet_id = tablet->tablet_id();
+                opts.segment_id = rssid;
+                opts.query_version = read_version;
+                opts.col_unique_id = cid_2_ucid[cid];
+                BitmapIndexIterator* iter = nullptr;
+                RETURN_IF_ERROR(segment->new_bitmap_index_iterator(cid_2_ucid[cid], opts, &iter));
+                return iter;
+            }));
+            if (!evaluator.has_bitmap_index()) {
+                return Status::NotSupported("secondary short circuit: segment has no bitmap index");
+            }
+            SparseRange<> scan_range;
+            scan_range.add(Range<rowid_t>(0, segment->num_rows()));
+            PredicateTree residual_tree;
+            RETURN_IF_ERROR(evaluator.evaluate(scan_range, residual_tree));
+            if (!residual_tree.empty()) {
+                return Status::NotSupported("secondary short circuit: predicate not covered by bitmap index");
+            }
+            if (scan_range.empty()) {
+                continue;
+            }
+            Roaring row_bitmap = range2roaring(scan_range);
+            if (read_version > 0) {
+                DelVectorPtr delvec;
+                RETURN_IF_ERROR(delvec_loader.load(TabletSegmentId(tablet->tablet_id(), rssid), read_version,
+                                                   &delvec));
+                if (delvec != nullptr && !delvec->empty()) {
+                    row_bitmap -= *(delvec->roaring());
+                }
+            }
+            std::vector<uint32_t>& rowids = rowids_by_rssid[rssid];
+            rowids.reserve(row_bitmap.cardinality());
+            for (uint32_t rowid : row_bitmap) {
+                rowids.push_back(rowid);
+            }
+            total_rows += rowids.size();
+            if (total_rows > MAX_SECONDARY_SCAN_ROWS) {
+                return Status::InternalError(
+                        fmt::format("secondary short circuit matched more than {} rows, aborting",
+                                    MAX_SECONDARY_SCAN_ROWS));
+            }
+        }
+    }
+
+    ChunkPtr tablet_chunk = ChunkFactory::new_chunk(value_schema, total_rows + 1);
+    if (total_rows == 0) {
+        return tablet_chunk;
+    }
+
+    // read columns in column-id order for page locality, then map back to the
+    // requested slot order (same idiom as multi_get)
+    std::vector<std::pair<uint32_t, uint32_t>> value_column_ids_by_order_with_orig_idx;
+    value_column_ids_by_order_with_orig_idx.reserve(value_column_ids.size());
+    for (uint32_t i = 0; i < value_column_ids.size(); ++i) {
+        value_column_ids_by_order_with_orig_idx.emplace_back(value_column_ids[i], i);
+    }
+    std::sort(value_column_ids_by_order_with_orig_idx.begin(),
+              value_column_ids_by_order_with_orig_idx.end());
+    std::vector<uint32_t> sorted_column_ids;
+    sorted_column_ids.reserve(value_column_ids_by_order_with_orig_idx.size());
+    for (const auto& p : value_column_ids_by_order_with_orig_idx) {
+        sorted_column_ids.push_back(p.first);
+    }
+    auto read_column_schema = ChunkHelper::convert_schema(tablet_schema, sorted_column_ids);
+    MutableColumns read_columns(sorted_column_ids.size());
+    for (uint32_t i = 0; i < read_columns.size(); ++i) {
+        read_columns[i] = ChunkFactory::column_from_field(*read_column_schema.field(i))->clone_empty();
+    }
+    RETURN_IF_ERROR(tablet->updates()->get_column_values(sorted_column_ids, read_version, false, rowids_by_rssid,
+                                                         &read_columns, nullptr, tablet_schema));
+    for (size_t j = 0; j < sorted_column_ids.size(); ++j) {
+        tablet_chunk->get_column_raw_ptr_by_index(value_column_ids_by_order_with_orig_idx[j].second)
+                ->append(*read_columns[j]);
+    }
+    return tablet_chunk;
+}
+
 StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletSharedPtr& tablet,
                                                                 const std::string& version,
                                                                 const std::vector<std::string>& value_field_names,
+                                                                const std::vector<starrocks::ColumnId>& value_column_ids,
                                                                 const Schema& value_schema) {
-    int64_t t0 = MonotonicMillis();
+    if (tablet->updates() != nullptr) {
+        auto rowid_result = _scan_one_tablet_by_bitmap_rowids(tablet, version, value_column_ids, value_schema);
+        if (rowid_result.ok()) {
+            return std::move(rowid_result.value());
+        }
+        if (!rowid_result.status().is_not_supported()) {
+            return rowid_result.status();
+        }
+        VLOG_ROW << "secondary short circuit: bitmap rowid path skipped on tablet " << tablet->tablet_id()
+                 << ": " << rowid_result.status();
+    }
     LocalTableReaderParams params;
     params.version = std::stoi(version);
     params.tablet_id = tablet->get_tablet_info().tablet_id;
     auto table_reader = std::make_shared<TableReader>();
     RETURN_IF_ERROR(table_reader->init(params));
-    int64_t t1 = MonotonicMillis();
     ASSIGN_OR_RETURN(ChunkIteratorPtr iterator, table_reader->scan(value_field_names, _secondary_predicates));
-    int64_t t2 = MonotonicMillis();
     ChunkPtr tablet_chunk = ChunkFactory::new_chunk(value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
     auto scan_chunk = ChunkFactory::new_chunk(value_schema, MAX_SECONDARY_SCAN_ROWS + 1);
     while (true) {
@@ -360,9 +511,6 @@ StatusOr<ChunkPtr> ShortCircuitHybridScanNode::_scan_one_tablet(const TabletShar
         }
         tablet_chunk->append(*scan_chunk);
     }
-    int64_t t3 = MonotonicMillis();
-    LOG(INFO) << "sec-scan tablet:" << params.tablet_id << " init:" << (t1 - t0) << "ms open:" << (t2 - t1)
-              << "ms read:" << (t3 - t2) << "ms rows:" << tablet_chunk->num_rows();
     return tablet_chunk;
 }
 
