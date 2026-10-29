@@ -57,7 +57,11 @@ public:
     Status _build_secondary_predicates(RuntimeState* state);
     StatusOr<ChunkPtr> _scan_one_tablet(const TabletSharedPtr& tablet, const std::string& version,
                                         const std::vector<std::string>& value_field_names,
+                                        const std::vector<starrocks::ColumnId>& value_column_ids,
                                         const Schema& value_schema);
+    StatusOr<ChunkPtr> _scan_one_tablet_by_bitmap_rowids(const TabletSharedPtr& tablet, const std::string& version,
+                                                        const std::vector<starrocks::ColumnId>& value_column_ids,
+                                                        const Schema& value_schema);
     Status _literal_to_storage_string(RuntimeState* state, const std::vector<TExprNode>& nodes, size_t idx, size_t size,
                                     std::string* out);
     Status _process_scan_chunk();
